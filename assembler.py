@@ -2,6 +2,7 @@
 import sys
 import re
 import struct
+from ctypes import c_int
 
 def bindigits(n, bits):
     s = bin(n & int("1"*bits, 2))[2:]
@@ -21,68 +22,35 @@ class EmulationState:
         self.C = 0
         self.V = 0
         for i in range(32):
-            self.r[i] = 0
+            self.r[i] = c_int(0)
 
-    #TODO fix for byte addressing
-    def load(self, addr):
+    def load_byte(self, addr):
         if addr in self.mem:
             return self.mem[addr]
         else:
             self.mem[addr] = 0
-            return self.load(addr)
-    
-    def store(self, addr, value):
-        self.mem[addr] = value
+            return 0
 
-    def set_state(self, value, N, Z, C, V):
+    def load(self, addr):
+        val = c_int((self.load_byte(addr) << 24) | (self.load_byte(addr+1) << 16) |
+                (self.load_byte(addr+2) << 8) | (self.load_byte(addr+3)))
+        return val
+    
+    def store(self, addr, x):
+        self.mem[addr] = (x.value & 0xff000000) >> 24
+        self.mem[addr+1] = (x.value & 0x00ff0000) >> 16
+        self.mem[addr+2] = (x.value & 0x0000ff00) >> 8
+        self.mem[addr+3] = (x.value & 0x000000ff)
+
+
+    def set_state(self, x, N, Z, C, V):
         if(N):
-            self.N = (1 if value < 0 else 0)
+            self.N = (1 if x.value < 0 else 0)
         if(Z):
-            self.Z = (1 if value == 0 else 0)
+            self.Z = (1 if x.value == 0 else 0)
         if(C):
             self.C = 0 # TODO
-        if(V):
-            self.V = (1 if value > 0xffffffff else 0)
         #print(str(hex(value)) + " N" + str(self.N)+ " Z" + str(self.Z)+ " C" + str(self.C)+ " V" + str(self.V))
-
-class UALInstruction:
-    OPCODE = {
-            'NOP' : ("orr\tr0, r0, r0",),
-            'ADD' : ("adds\tr{0}, r{1}, r{2}",),
-            'SUB' : ("subs\tr{0}, r{1}, r{2}",),
-            'AND' : ("ands\tr{0}, r{1}, r{2}",),
-            'ORRI': ("sub\tsp, sp, #8", "str\tr0, [sp, #0]", "ldr\tr0, ={2}", "orr\tr{0}, r{1}, r0", "str\tr{0}, [sp, #4]", "ldr\tr0, [sp, #0]", "ldr\tr{0}, [sp, #4]", "add\t sp, sp, #8", "orrs\tr{0}, r{0}, r{0}"),
-            'LSL' : ("movs\tr{0}, r{1}, lsl #{2}",),
-            'ASR' : ("movs\tr{0}, r{1}, asr #{2}",),
-            'LDR' : ("ldr\tr{0}, [r{1}, r{2}]",),
-            'STR' : ("str\tr{0}, [r{1}, r{2}]",),
-            }
-    BRANCHES = {       
-            'B'   : ("b\t{0}",),
-            'B.EQ': ("beq\t{0}",),
-            'B.LT': ("blt\t{0}",),
-            }
-
-    def __init__(self, instruction):
-        self.SCop = instruction  # type: Instruction
-        self.ual = []
-        self.label = "\t"
-        if self.SCop.op in UALInstruction.OPCODE:
-            ual = UALInstruction.OPCODE[self.SCop.op]
-            for instr in ual:
-                self.ual.append(instr.format(*self.SCop.args[0]) + "\n")
-        elif self.SCop.op in UALInstruction.BRANCHES:
-            self.ual.append("branches not implemented\n")
-    
-    def get_ual(self):
-        code = ""
-        code += self.label + "\t"
-        code += self.ual[0]
-        for line in self.ual[1:]:
-            code += "\t\t"
-            code += line
-        return code
-
 
 class Instruction:
     def __init__(self, source_line):
@@ -96,31 +64,36 @@ class Instruction:
         pass
 
     def ADD(self, s):
-        result = s.r[self.SA()] + s.r[self.SB()]
+        result = c_int(s.r[self.SA()].value + s.r[self.SB()].value)
         s.set_state(result, True, True, True, True)
-        s.r[self.DR()] = result & 0xffffffff
+        s.r[self.DR()] = result
+        if(result.value < s.r[self.SA()].value):
+            s.V = 1
     
     def SUB(self, s):
-        result = s.r[self.SA()] - s.r[self.SB()]
+        result = c_int(s.r[self.SA()].value - s.r[self.SB()].value)
         s.set_state(result, True, True, True, True)
-        s.r[self.DR()] = result & 0xffffffff
+        s.r[self.DR()] = result
+        if(result.value > s.r[self.SA()].value):
+            s.V = 1
 
     def AND(self, s):
-        s.r[self.DR()] = s.r[self.SA()] & s.r[self.SB()]
+        s.r[self.DR()] = c_int(s.r[self.SA()].value & s.r[self.SB()].value)
         s.set_state(s.r[self.DR()], True, True, False, False)
 
     def ORRI(self, s):
-        s.r[self.DR()] = s.r[self.SA()] | self.IMM()
+        s.r[self.DR()] = c_int(s.r[self.SA()].value | self.IMM())
         s.set_state(s.r[self.DR()], True, True, False, False)
 
     def LSL(self, s):
-        result = (s.r[self.SA()] << self.IMM()) 
+        result = c_int(s.r[self.SA()].value << self.IMM()) 
         s.set_state(result, True, True, True, False)
-        s.r[self.DR()] = result & 0xffffffff
+        s.r[self.DR()] = result
 
     def ASR(self, s):
-        s.r[self.DR()] = asr(s.r[self.SA()], self.IMM())
+        s.r[self.DR()] = c_int(asr(s.r[self.SA()].value , self.IMM()))
         s.set_state(s.r[self.DR()], True, True, True, True)
+        #TODO what is an overflow here?
 
     def B(self, s):
         s.pc += int(self.args[0][0])
@@ -134,10 +107,10 @@ class Instruction:
             s.pc += int(self.args[0][0])
 
     def LDR(self, s):
-        s.r[self.DR()] = s.load(s.r[self.SA()] + s.r[self.SB()]);
+        s.r[self.DR()] = s.load(s.r[self.SA()].value + s.r[self.SB()].value);
 
     def STR(self, s):
-        s.store(s.r[self.SA()]+s.r[self.SB()], s.r[self.DR()])
+        s.store(s.r[self.SA()].value+s.r[self.SB()].value, s.r[self.DR()])
 
     def DR(self):
         return int(self.args[0][0])
@@ -188,7 +161,6 @@ class Instruction:
 
     def execute(self, state):
         self.opcode[3](self, state)
-        print(state.r[0])
 
 def main():
     source_path = sys.argv[1]
@@ -211,9 +183,8 @@ def main():
             state.instruction_memory[state.pc].execute(state)
             state.pc += 1
         for i in state.r:
-            print("R" + str(i) + " = " + str(hex(state.r[i])))
-        for i in state.mem:
-            print(str(hex(i)) + " = " + str(hex(state.mem[i])))
+            if(state.r[i].value):
+                print("R" + str(i) + " = " + str(hex(state.r[i].value)))
 
 if __name__ == "__main__":
     main()
